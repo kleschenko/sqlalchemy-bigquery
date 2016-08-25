@@ -1,96 +1,157 @@
 """
 Support for Google BigQuery.
 
-Does not support actually connecting to BQ.
-Directly derived from the mssql dialect with minor modifications
-
 """
-import sqlalchemy.dialects.mssql.base as mssql_base
+from sqlalchemy import sql, types, pool
+from sqlalchemy.engine import default, reflection
 
-from sqlalchemy.dialects.mssql.base import MSDialect
-from sqlalchemy.sql import compiler
-from sqlalchemy.sql import sqltypes
+from bqtypes import (BQString, BQInteger, BQFloat, BQTimestamp, BQBytes, BQBoolean)
+from compiler import BQSQLCompiler, BQDDLCompiler
 
-
-class BQString(sqltypes.String):
-    def __init__(
-        self,
-        length=None,
-        collation=None,
-        convert_unicode=False,
-        unicode_error=None,
-        _warn_on_bytestring=False
-    ):
-        return super(BQString, self).__init__(
-            length=length,
-            collation=collation,
-            convert_unicode=convert_unicode,
-            unicode_error=unicode_error,
-            _warn_on_bytestring=_warn_on_bytestring
-        )
-
-    def literal_processor(self, dialect):
-        def process(value):
-            value = value.replace("'", "\\'")
-            return "'%s'" % value
-        return process
+import dbapi
 
 
-class BQSQLCompiler(mssql_base.MSSQLCompiler):
-
-    def get_select_precolumns(self,select, **kw):
-        """BQ uses TOP differently from MS-SQL"""
-        s = ""
-        if select._distinct:
-            s += "DISTINCT "
-
-        if s:
-            return s
-        else:
-            return compiler.SQLCompiler.get_select_precolumns(
-                    self, select, **kw)
-
-    def limit_clause(self, select, **kw):
-        """Only supports simple (integer) LIMIT clause"""
-        s = ""
-        if select._simple_int_limit and not select._offset:
-            s += "\nLIMIT %d " % select._limit
-        
-        return s
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+class BQExecutionContext(default.DefaultExecutionContext):
+    def get_lastrowid(self):
+        return self.cursor.lastrowid
 
 
-    def visit_column(self, column, add_to_result_map=None, **kwargs):
-        # TODO: figure out how to do this immutably
-        # force column rendering to not use quotes by declaring every col literal
-        column.is_literal = True
-        return super(BQSQLCompiler, self).visit_column(
-            column,
-            add_to_result_map=add_to_result_map,
-            **kwargs
-        )
-
-    def visit_match_op_binary(self, binary, operator, **kw):
-        return "%s CONTAINS %s" % (
-            self.process(binary.left, **kw),
-            self.process(binary.right, **kw))
-
-
-class BQIdentifierPreparer(compiler.IdentifierPreparer):
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+class BQIdentifierPreparer(sql.compiler.IdentifierPreparer):
     def __init__(self, dialect):
-        super(BQIdentifierPreparer, self).__init__(
-            dialect,
-            initial_quote='[',
-            final_quote=']',
-        )
+        super(BQIdentifierPreparer, self).__init__(dialect)
 
     def format_label(self, label, name=None):
         """ bq can't handle quoting labels """
         return name or label.name
 
 
-class BQDialect(MSDialect):
-    statement_compiler = BQSQLCompiler
-    preparer = BQIdentifierPreparer
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+class BQDialect(default.DefaultDialect):
     colspecs = {
-        sqltypes.String: BQString
+        types.Unicode: BQString,
+        types.Integer: BQInteger,
+        types.SmallInteger: BQInteger,
+        types.Numeric: BQFloat,
+        types.Float: BQFloat,
+        types.DateTime: BQTimestamp,
+        types.Date: BQTimestamp,
+        types.String: BQString,
+        types.LargeBinary: BQBytes,
+        types.Boolean: BQBoolean,
+        types.Text: BQString,
+        types.CHAR: BQString,
+        types.TIMESTAMP: BQTimestamp,
+        types.VARCHAR: BQString
     }
+
+    __TYPE_MAPPINGS = {'TIMESTAMP': types.DateTime(),
+                       'STRING': types.String(),
+                       'FLOAT': types.Float(),
+                       'INTEGER': types.Integer(),
+                       'BOOLEAN': types.Boolean()}
+
+    name = 'bigquery'
+    driver = 'bq1'
+    poolclass = pool.SingletonThreadPool
+    statement_compiler = BQSQLCompiler
+    ddl_compiler = BQDDLCompiler
+    preparer = BQIdentifierPreparer
+    execution_ctx_cls = BQExecutionContext
+
+    supports_alter = False
+    supports_unicode_statements = True
+    supports_sane_multi_rowcount = False
+    supports_sane_rowcount = False
+    supports_sequences = False
+    supports_native_enum = False
+
+    positional = False
+    paramstyle = 'named'
+
+    default_sequence_base = 0
+    default_schema_name = None
+
+    #  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
+    def __init__(self, **kw):
+        #
+        # Create a dialect object
+        #
+        super(BQDialect, self).__init__(**kw)
+
+    #  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
+    def create_connect_args(self, url):
+        #
+        # This function recovers connection parameters from the connection string
+        #
+        return [], {}
+
+    #  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
+    def initialize(self, connection):
+        """disable all dialect initialization"""
+
+    #  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
+    @classmethod
+    def dbapi(cls):
+        return dbapi
+
+    #  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
+    def do_execute(self, cursor, statement, parameters, context=None):
+        cursor.execute(statement, parameters)
+
+    #  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
+    def do_executemany(self, cursor, statement, parameters, context=None):
+        cursor.executemany(statement, parameters)
+
+    #  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
+    def get_schema_names(self, engine, **kw):
+        return engine.connect().connection.get_schema_names()
+
+    #  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
+    def get_view_names(self, connection, schema=None, **kw):
+        raise NotImplementedError()
+
+    #  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
+    def get_view_definition(self, connection, viewname, schema=None, **kw):
+        raise NotImplementedError()
+
+    #  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
+    def has_table(self, connection, table_name, schema=None):
+        return table_name in connection.connection.get_table_names()
+
+    #  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
+    @reflection.cache
+    def get_table_names(self, engine, schema=None, **kw):
+        return engine.connect().connection.get_table_names()
+
+    #  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
+    def get_columns(self, engine, table_name, schema=None, **kw):
+        cols = engine.connect().connection.get_columns(table_name)
+
+        get_coldef = lambda x, y: {"name": x,
+                                   "type": BQDialect.__TYPE_MAPPINGS.get(y, types.Binary()),
+                                   "nullable": True,
+                                   "default": None}
+
+        return [get_coldef(*col) for col in cols]
+
+    #  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
+    def get_primary_keys(self, engine, table_name, schema=None, **kw):
+        return []
+
+    #  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
+    def get_foreign_keys(self, engine, table_name, schema=None, **kw):
+        return []
+
+    #  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
+    def get_indexes(self, connection, table_name, schema=None, **kw):
+        return []
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+dialect = BQDialect
